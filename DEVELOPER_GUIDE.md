@@ -12,7 +12,7 @@ This guide explains the internal structure of the `concepts/` module for develop
 segmentation_with_concepts/
 ├── INTEGRATION_GUIDE.md                 # Practical usage examples
 ├── sam3/
-│   ├── concepts/                        # Our new module
+│   ├── concepts/                        # Concept segmentation module
 │   │   ├── __init__.py                  # Package exports
 │   │   ├── config.py                    # Configuration dataclasses
 │   │   ├── utils.py                     # Image/video utilities
@@ -22,9 +22,9 @@ segmentation_with_concepts/
 │   │   └── README.md                    # Module documentation
 │   ├── run_concept_segmentation.py      # Main CLI tool
 │   ├── run_binary_mask_converter.py     # Binary mask CLI tool
-│   ├── model/                           # Original SAM3 models (unchanged)
-│   ├── examples/                        # Official examples
-│   └── ... (other original SAM3 files)
+│   ├── model/                           # SAM3 model files
+│   ├── examples/                        # SAM3 examples
+│   └── ... (other SAM3 files)
 └── Developer_Guide.md                   # This file
 ```
 
@@ -148,8 +148,8 @@ def new_utility_function(param1: np.ndarray, param2: int) -> np.ndarray:
    - Exposes clear API: load → plan → process → get_outputs
 
 **Architecture Notes**:
-- ✅ User-level orchestration (we control WHEN to call SAM3)
-- ✅ SAM3 unchanged (we don't modify propagation algorithm)
+- ✅ User-level orchestration: controls when SAM3 sessions are opened and closed
+- ✅ SAM3 propagation algorithm is not modified
 - ✅ Clear separation of concerns
 - ✅ Extensible for future enhancements
 
