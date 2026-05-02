@@ -17,7 +17,7 @@ Supports:
 import argparse
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -34,6 +34,7 @@ try:
         OutputMode,
         PropagationDirection,
         MemoryStrategy,
+        ExemplarPlacement,
     )
     from concepts.sam3_concepts_segmenter import ConceptSegmentationStrategy
     from concepts.mask_processor import MaskProcessor
@@ -49,6 +50,7 @@ except ImportError:
         OutputMode,
         PropagationDirection,
         MemoryStrategy,
+        ExemplarPlacement,
     )
     from concepts.sam3_concepts_segmenter import ConceptSegmentationStrategy
     from concepts.mask_processor import MaskProcessor
@@ -81,12 +83,26 @@ def parse_concepts(concept_text: str) -> List[str]:
     return concepts
 
 
+def parse_exemplar_box(box_text: str) -> Tuple[float, float, float, float]:
+    """Parse an absolute-pixel exemplar box in x,y,w,h format."""
+    parts = [part.strip() for part in box_text.split(",")]
+    if len(parts) != 4:
+        fail("--exemplar-box must contain exactly four comma-separated values: x,y,w,h")
+
+    try:
+        x, y, width, height = (float(part) for part in parts)
+    except ValueError as exc:
+        fail(f"Invalid --exemplar-box value '{box_text}': {exc}")
+
+    return x, y, width, height
+
+
 def build_argument_parser():
     """Build and return CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="run_concept_segmentation",
         description=(
-            "Run SAM3 video concept segmentation with text prompts.\n"
+            "Run SAM3 video segmentation with text prompts and optional external image exemplar injection.\n"
             "Supports multiple output modes and flexible memory/chunk strategies."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -114,6 +130,15 @@ Examples:
     --output-mode segmented_only \\
     --chunk-size 200 \\
     --overlap 40
+
+    # External exemplar pseudo-frame injection with text+visual fusion:
+    python run_concept_segmentation.py \
+        --video input.mp4 \
+        --concepts "speed limit 30 sign" \
+        --exemplar-image exemplar_30.jpg \
+        --exemplar-bbox "145,98,62,64" \
+        --exemplar-placement letterbox \
+        --output output.mp4
         """,
     )
     
@@ -124,14 +149,42 @@ Examples:
         help="Path to input video (mp4, avi, etc.)",
     )
     parser.add_argument(
+        "--output",
+        required=True,
+        help="Path to output video (mp4) or directory (for binary masks)",
+    )
+    parser.add_argument(
         "--concepts",
         required=True,
         help="Dot-separated semantic concepts (e.g., 'traffic sign. speed limit sign.')",
     )
+
+    # Optional external exemplar pseudo-frame injection
     parser.add_argument(
-        "--output",
-        required=True,
-        help="Path to output video (mp4) or directory (for binary masks)",
+        "--exemplar-image",
+        help="Path to external exemplar image used as pseudo-frame at each chunk start",
+    )
+    parser.add_argument(
+        "--exemplar-bbox",
+        help="Exemplar bbox in source image absolute pixel x,y,w,h format",
+    )
+    parser.add_argument(
+        "--exemplar-placement",
+        type=str,
+        default="letterbox",
+        choices=["letterbox", "canvas"],
+        help="How exemplar image is fitted to video size before remapping bbox (default: letterbox)",
+    )
+    parser.add_argument(
+        "--exemplar-box-label",
+        type=int,
+        default=1,
+        choices=[0, 1],
+        help="Exemplar box label: 1 for positive (include region), 0 for negative (exclude region) (default: 1)",
+    )
+    parser.add_argument(
+        "--debug-exemplar-preview",
+        help="Optional output image path for fitted exemplar preview with remapped bbox",
     )
     
     # Output rendering
@@ -194,9 +247,42 @@ Examples:
         help="Disable temporal disambiguation in SAM3",
     )
     parser.add_argument(
+        "--offload-video-to-cpu",
+        action="store_true",
+        help="Keep loaded video frames on CPU in the SAM3 inference state (safer on constrained/MIG GPUs).",
+    )
+    parser.add_argument(
+        "--disable-tf32",
+        action="store_true",
+        help="Disable Tensor Float 32 (slower but more stable on some MIG GPUs).",
+    )
+    parser.add_argument(
+        "--max-num-objects",
+        type=int,
+        default=None,
+        help="Limit maximum number of tracked objects (default: model default ~10000). Lower values reduce memory pressure.",
+    )
+    parser.add_argument(
+        "--no-inter-chunk-cuda-drain",
+        action="store_true",
+        help="Disable explicit CUDA drain between chunks (enabled by default).",
+    )
+    parser.add_argument(
+        "--inter-chunk-sleep-sec",
+        type=float,
+        default=0.0,
+        help="Optional sleep after chunk cleanup before starting next chunk (default: 0.0).",
+    )
+    compile_group = parser.add_mutually_exclusive_group()
+    compile_group.add_argument(
+        "--compile",
+        action="store_true",
+        help="Enable torch compile optimization (can be unstable on some MIG setups)",
+    )
+    compile_group.add_argument(
         "--no-compile",
         action="store_true",
-        help="Disable model compilation optimization",
+        help="Deprecated alias kept for compatibility; compile is already disabled by default.",
     )
     
     # Utility
@@ -226,32 +312,75 @@ def main():
     # Parse and validate paths
     video_path = Path(args.video).expanduser().resolve()
     output_path = Path(args.output).expanduser().resolve()
+    binary_video_exts = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    binary_output_is_video = (
+        args.output_mode == "binary_masks_only"
+        and output_path.suffix.lower() in binary_video_exts
+    )
+    binary_output_dir = output_path
     
     if not video_path.exists():
         fail(f"Input video does not exist: {video_path}")
     
     # Create output directory if needed
     if args.output_mode == "binary_masks_only":
-        output_path.mkdir(parents=True, exist_ok=True)
+        # Binary mask mode supports either video output or PNG frame directory output.
+        if binary_output_is_video:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+        elif output_path.suffix:
+            binary_output_dir = output_path.with_suffix("")
+            print(
+                f"[WARN] --output '{output_path}' looks like a file path; "
+                f"using directory '{binary_output_dir}' for binary mask frames.",
+                file=sys.stderr,
+            )
+        binary_output_dir.mkdir(parents=True, exist_ok=True)
     else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
     
     # Parse concepts
     concepts = parse_concepts(args.concepts)
+    exemplar_bbox = parse_exemplar_box(args.exemplar_bbox) if args.exemplar_bbox else None
+    prompt_labels = concepts
+
+    if bool(args.exemplar_image) != bool(args.exemplar_bbox):
+        fail("--exemplar-image and --exemplar-bbox must be provided together")
+
     if args.verbose:
         print(f"[INFO] Concepts: {concepts}", file=sys.stderr)
+        if args.exemplar_image:
+            print(
+                f"[INFO] Exemplar image: {args.exemplar_image}, bbox={exemplar_bbox}, placement={args.exemplar_placement}",
+                file=sys.stderr,
+            )
+            if args.debug_exemplar_preview:
+                print(
+                    f"[INFO] Exemplar preview path: {args.debug_exemplar_preview}",
+                    file=sys.stderr,
+                )
     
     # Build configurations
     try:
+        compile_enabled = bool(args.compile)
         segmentation_config = ConceptSegmentationConfig(
             concepts=concepts,
+            exemplar_image_path=args.exemplar_image,
+            exemplar_image_bbox=exemplar_bbox,
+            exemplar_placement=ExemplarPlacement(args.exemplar_placement),
+            exemplar_box_label=args.exemplar_box_label,
+            debug_exemplar_preview_path=args.debug_exemplar_preview,
             chunk_size=args.chunk_size,
             overlap=args.overlap,
             propagation_direction=PropagationDirection(args.propagation_direction),
             memory_strategy=MemoryStrategy(args.memory_strategy),
             apply_temporal_disambiguation=not args.no_temporal_disambiguation,
+            offload_video_to_cpu=args.offload_video_to_cpu,
+            disable_tf32=args.disable_tf32,
+            max_num_objects=args.max_num_objects,
+            inter_chunk_cuda_drain=not args.no_inter_chunk_cuda_drain,
+            inter_chunk_sleep_sec=args.inter_chunk_sleep_sec,
             output_prob_thresh=args.threshold,
-            compile=not args.no_compile,
+            compile=compile_enabled,
         )
         
         mask_processor_config = MaskProcessorConfig(
@@ -342,24 +471,42 @@ def main():
     print("[INFO] Rendering output...", file=sys.stderr)
     
     processor = MaskProcessor(mask_processor_config)
-    processor.set_palette(len(concepts))
+    processor.set_palette(len(prompt_labels))
     
     output_frames = []
     all_outputs = strategy.get_all_outputs()
     
     for frame_idx, frame in enumerate(strategy.video_frames):
         outputs = all_outputs.get(frame_idx, {})
-        processed_frame, labels = processor.process_frame(frame, outputs, concept_names=concepts)
+        processed_frame, labels = processor.process_frame(
+            frame,
+            outputs,
+            concept_names=prompt_labels,
+        )
         output_frames.append(processed_frame)
     
     # Save output
     if args.output_mode == "binary_masks_only":
-        print(f"[INFO] Saving binary masks to: {output_path}", file=sys.stderr)
-        processor.save_mask_frames(
-            {i: outputs.get("out_binary_masks", np.array([])) for i, outputs in all_outputs.items()},
-            str(output_path),
-            prefix="concept_mask"
-        )
+        if binary_output_is_video:
+            print(f"[INFO] Saving binary mask video to: {output_path}", file=sys.stderr)
+            fps = strategy.video_metadata["fps"]
+            codec = "mp4v"
+            try:
+                processor.save_video(
+                    output_frames,
+                    str(output_path),
+                    fps,
+                    codec=codec,
+                )
+            except Exception as e:
+                fail(f"Failed to save binary mask video: {e}")
+        else:
+            print(f"[INFO] Saving binary masks to: {binary_output_dir}", file=sys.stderr)
+            processor.save_mask_frames(
+                {i: outputs.get("out_binary_masks", np.array([])) for i, outputs in all_outputs.items()},
+                str(binary_output_dir),
+                prefix="concept_mask"
+            )
     else:
         print(f"[INFO] Saving output video to: {output_path}", file=sys.stderr)
         fps = strategy.video_metadata["fps"]
@@ -378,7 +525,13 @@ def main():
     # Summary
     final_summary = strategy.get_summary()
     print(f"[INFO] Segmentation complete. Processed {final_summary['frames_with_output']} frames.", file=sys.stderr)
-    print(f"[SUCCESS] Output saved to: {output_path}", file=sys.stderr)
+    if args.output_mode == "binary_masks_only":
+        if binary_output_is_video:
+            print(f"[SUCCESS] Output saved to: {output_path}", file=sys.stderr)
+        else:
+            print(f"[SUCCESS] Output saved to: {binary_output_dir}", file=sys.stderr)
+    else:
+        print(f"[SUCCESS] Output saved to: {output_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":

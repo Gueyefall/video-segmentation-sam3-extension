@@ -15,6 +15,7 @@ from .config import (
     ConceptSegmentationConfig,
     MaskProcessorConfig,
     BinaryMaskConfig,
+    ExemplarPlacement,
 )
 from .sam3_concepts_segmenter import ConceptSegmentationStrategy
 from .mask_processor import MaskProcessor
@@ -24,6 +25,7 @@ __all__ = [
     "ConceptSegmentationConfig",
     "MaskProcessorConfig",
     "BinaryMaskConfig",
+    "ExemplarPlacement",
     "ConceptSegmentationStrategy",
     "MaskProcessor",
     "BinaryMaskConverter",
