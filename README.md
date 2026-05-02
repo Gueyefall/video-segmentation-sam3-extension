@@ -8,6 +8,8 @@ This workspace contains SAM3 together with the `concepts/` module, which adds co
 - `sam3/concepts/` — Concept segmentation module: configuration, chunk processing, mask rendering, binary mask tools.
 - `sam3/run_concept_segmentation.py` — CLI for end-to-end concept-based video segmentation.
 - `sam3/run_binary_mask_converter.py` — CLI for binary mask post-processing.
+- `sam3/scripts/overlay_with_binary_selector.py` — CLI for compositing a mask video onto a base video using a binary selector.
+- `SL30_image_examplar_*.webp` — Sample speed-limit-30 exemplar images used by the external-image prompting workflow.
 
 ## Installation
 

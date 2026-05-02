@@ -89,6 +89,19 @@ python run_concept_segmentation.py \
 
 **Output**: Directory with PNG images for each frame's binary mask
 
+**Alternative: Save binary masks as a video file**
+
+```bash
+python run_concept_segmentation.py \
+  --video input.mp4 \
+  --concepts "speed limit" \
+  --output ./masks_output.mp4 \
+  --output-mode binary_masks_only \
+  --threshold 0.6
+```
+
+When `--output` has a video extension (`.mp4`, `.avi`, etc.), binary masks are written as a video instead of a PNG directory.
+
 **Follow-up: Process masks with converter**
 
 ```bash
@@ -104,9 +117,55 @@ python run_binary_mask_converter.py \
   --output-dir ./masks_cleaned \
   --dilate-kernel 3 \
   --erode-kernel 2
+
+# Apply standalone morphological op
+python run_binary_mask_converter.py \
+  --batch-dir ./masks_output \
+  --output-dir ./masks_closed \
+  --morph-op close \
+  --morph-kernel 5
+```
+
+**Follow-up: Process a mask video directly**
+
+```bash
+# Convert an entire mask video to binary + invert
+python run_binary_mask_converter.py \
+  --input-video ./masks_output.mp4 \
+  --output-video ./masks_binary_inverted.mp4 \
+  --threshold 0.08 \
+  --invert \
+  --verbose
 ```
 
 **When to use**: Post-processing pipelines, downstream analysis, model evaluation
+
+---
+
+### Scenario 3b: Video Compositing with Binary Selector
+
+**Goal**: Composite a segmented mask video onto a different base video (e.g., generated or edited) using a binary selector to control per-pixel source selection.
+
+```bash
+python scripts/overlay_with_binary_selector.py \
+  --base-video cosmos_output.mp4 \
+  --mask-video input_traffic_signs_masks.mp4 \
+  --binary-video input_traffic_signs_binary.mp4 \
+  --output-video composited_output.mp4
+```
+
+**How it works**:
+- White pixels in the binary selector → pixels from the mask video (foreground).
+- Black pixels in the binary selector → pixels from the base video (background).
+- Threshold (default 127) controls binarization of the selector.
+
+**Optional flags**:
+- `--binary-inverted-video path.mp4` — Provide inverted selector for consistency checking.
+- `--threshold 200` — Custom binarization threshold [0-255].
+- `--max-frames 500` — Cap the number of frames processed.
+- `--strict-size-check` — Fail on size mismatch instead of resizing.
+
+**When to use**: Combining segmentation masks with world-model outputs (e.g., Cosmos), re-injecting detected regions into generated videos, or replacing backgrounds while preserving foreground.
 
 ---
 
@@ -161,6 +220,41 @@ python run_concept_segmentation.py \
 
 ---
 
+### Scenario 6: External Exemplar Injection (Text + Visual Fusion)
+
+**Goal**: Condition each chunk with one external exemplar image and bbox while still using text concepts.
+
+```bash
+python run_concept_segmentation.py \
+  --video input.mp4 \
+  --concepts "speed limit 30 sign" \
+  --exemplar-image ../SL30_image_examplar_00.webp \
+  --exemplar-bbox "145,98,62,64" \
+  --exemplar-placement letterbox \
+  --exemplar-box-label 1 \
+  --debug-exemplar-preview ./debug/sl30_remap_preview.jpg \
+  --output output.mp4 \
+  --output-mode overlay
+```
+
+**What this does**:
+- Uses your external exemplar image as a pseudo-frame at the start of every chunk session.
+- Automatically remaps bbox coordinates after image fitting to the video resolution.
+- Fuses text prompt and visual bbox cue in the same add-prompt request.
+- Drops pseudo-frame outputs and maps predictions back to original video frame indices.
+
+**Placement modes**:
+- `letterbox` (recommended): Preserve aspect ratio, pad to video size, remap bbox automatically.
+- `canvas`: No resizing, centered placement on padded canvas, remap bbox by offset only.
+
+**Repo-provided sample exemplars**:
+- From the `sam3/` directory, use `../SL30_image_examplar_00.webp` through `../SL30_image_examplar_05.webp`.
+- Use `--exemplar-box-label 1` for a positive exemplar and `--exemplar-box-label 0` for a negative/exclusion exemplar.
+
+**When to use**: Fine-grained disambiguation such as speed-limit-30 vs speed-limit-50/70.
+
+---
+
 ## Programmatic Usage (Python API)
 
 ### Basic End-to-End Example
@@ -176,6 +270,8 @@ seg_config = ConceptSegmentationConfig(
     concepts=["speed limit sign"],
     chunk_size=130,
     overlap=26,
+    exemplar_image_path="../SL30_image_examplar_00.webp",
+    exemplar_image_bbox=(145, 98, 62, 64),
 )
 
 # 2. Load video and plan chunks
@@ -212,7 +308,11 @@ processor.save_video(output_frames, "output.mp4", fps)
 ### Advanced: Custom Memory Strategy
 
 ```python
-from concepts.config import ConceptSegmentationConfig, MemoryStrategy
+from concepts.config import (
+  ConceptSegmentationConfig,
+  MemoryStrategy,
+  PropagationDirection,
+)
 
 # Temporal decay for very long videos
 config = ConceptSegmentationConfig(
@@ -220,7 +320,7 @@ config = ConceptSegmentationConfig(
     chunk_size=100,
     overlap=20,
     memory_strategy=MemoryStrategy.TEMPORAL_DECAY,
-    propagation_direction="forward",
+  propagation_direction=PropagationDirection.FORWARD,
 )
 
 strategy = ConceptSegmentationStrategy(config)
@@ -324,14 +424,16 @@ binary_masks = converter.batch_convert_masks(batch_masks, threshold=0.6)
 ### Config 1: Real-Time Processing (Speed Optimized)
 
 ```python
+from concepts.config import ConceptSegmentationConfig, MemoryStrategy, PropagationDirection
+
 config = ConceptSegmentationConfig(
     concepts=["traffic sign"],
     chunk_size=250,          # Large chunks = fewer boundaries
     overlap=20,              # Minimal overlap
-    propagation_direction="forward",  # One direction only
-    memory_strategy="reset_per_chunk",  # No memory overhead
+    propagation_direction=PropagationDirection.FORWARD,
+    memory_strategy=MemoryStrategy.RESET_PER_CHUNK,
     apply_temporal_disambiguation=False,  # Disable extra processing
-  compile=True,            # Enable torch compile (opt-in)
+    compile=True,           # Enable torch compile (opt-in)
 )
 ```
 
@@ -345,14 +447,16 @@ explicitly only when your environment is stable with Torch Inductor.
 ### Config 2: Accuracy Optimized (Quality First)
 
 ```python
+from concepts.config import ConceptSegmentationConfig, MemoryStrategy, PropagationDirection
+
 config = ConceptSegmentationConfig(
     concepts=["traffic sign", "speed limit", "stop sign"],
     chunk_size=150,
     overlap=50,              # High overlap for smoothness
-    propagation_direction="both",  # Bidirectional
-    memory_strategy="continuous",  # Full context
+    propagation_direction=PropagationDirection.BOTH,
+    memory_strategy=MemoryStrategy.CONTINUOUS,
     apply_temporal_disambiguation=True,  # Extra refinement
-  compile=False,           # Keep compile off for stability/reproducibility
+    compile=False,          # Keep compile off for stability/reproducibility
 )
 ```
 
@@ -363,12 +467,14 @@ config = ConceptSegmentationConfig(
 ### Config 3: Memory Constrained (Limited VRAM)
 
 ```python
+from concepts.config import ConceptSegmentationConfig, MemoryStrategy, PropagationDirection
+
 config = ConceptSegmentationConfig(
     concepts=["speed limit"],
     chunk_size=80,           # Small chunks
     overlap=10,              # Minimal overlap
-    propagation_direction="forward",
-    memory_strategy="reset_per_chunk",
+  propagation_direction=PropagationDirection.FORWARD,
+  memory_strategy=MemoryStrategy.RESET_PER_CHUNK,
     async_loading_frames=True,  # Load frames progressively
 )
 ```
@@ -396,7 +502,37 @@ config = ConceptSegmentationConfig(
 # compile is already OFF by default; do not pass --compile
 ```
 
+**Solution 4: Offload video frames to CPU**
+```bash
+--offload-video-to-cpu
+```
+
+**Solution 5: Disable TF32 (slower but more stable on MIG)**
+```bash
+--disable-tf32
+```
+
+**Solution 6: Limit tracked objects**
+```bash
+--max-num-objects 5000
+```
+
 If you previously enabled compile, remove `--compile` from your command.
+
+### Issue: CUDA Allocator Asserts (MIG/A100)
+
+The strategy layer automatically retries with progressive fallback strategies.
+Manual mitigation:
+
+```bash
+python run_concept_segmentation.py \
+  --video input.mp4 \
+  --concepts "traffic sign" \
+  --output output.mp4 \
+  --offload-video-to-cpu \
+  --disable-tf32 \
+  --inter-chunk-sleep-sec 1.0
+```
 
 ### Issue: PyTorch Inductor crash on MIG/A100
 

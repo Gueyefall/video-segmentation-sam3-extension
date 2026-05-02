@@ -2,13 +2,12 @@
 
 ## Overview
 
-This module provides a professional, modular architecture for concept-based semantic video segmentation using SAM3. It enables sophisticated video analysis with:
+This module adds concept-driven video segmentation on top of SAM3. It provides:
 
 - **Memory bank management** for tracking concept embeddings across video chunks
-- **Flexible chunk processing** with configurable overlap and temporal strategies
+- **Chunk processing** with configurable overlap
 - **Multiple output formats** (overlay, segmented regions, binary masks)
-- **Standalone binary mask tools** for post-processing and mask inversion
-- **Comprehensive documentation** and type hints throughout
+- **Standalone binary mask tools** for post-processing
 
 ## Architecture
 
@@ -97,22 +96,50 @@ python run_concept_segmentation.py \
   --propagation-direction both
 ```
 
-### 5. Binary Mask Conversion (Standalone)
+### 5. External Exemplar Injection (Text + Visual Fusion)
 
 ```bash
-# Convert probability mask to binary with inversion
+# Use one of the repo's sample exemplar images to disambiguate similar concepts
+python run_concept_segmentation.py \
+  --video input.mp4 \
+  --concepts "speed limit 30 sign" \
+  --exemplar-image ../SL30_image_examplar_00.webp \
+  --exemplar-bbox "145,98,62,64" \
+  --exemplar-placement letterbox \
+  --exemplar-box-label 1 \
+  --debug-exemplar-preview ./debug/preview.jpg \
+  --output output.mp4 \
+  --output-mode overlay
+```
+
+The exemplar image is injected as a pseudo-frame at the start of every chunk session.
+The bbox is automatically remapped after fitting to the video resolution.
+Pseudo-frame outputs are dropped and predictions are mapped back to original indices.
+The repo ships six sample assets for this workflow: `../SL30_image_examplar_00.webp` through `../SL30_image_examplar_05.webp`.
+
+### 6. Binary Mask Conversion (Standalone)
+
+```bash
+# Convert probability mask to binary with inversion (default threshold: 0.08)
 python run_binary_mask_converter.py \
   --input mask_prob.png \
   --output mask_binary_inverted.png \
-  --threshold 0.5 \
+  --threshold 0.08 \
   --invert
 
-# Apply morphological operations
+# Apply morphological operations via config
 python run_binary_mask_converter.py \
   --input mask.png \
   --output mask_closed.png \
   --dilate-kernel 3 \
   --erode-kernel 2
+
+# Apply standalone morphological operation (open, close, dilate, erode)
+python run_binary_mask_converter.py \
+  --input mask.png \
+  --output mask_opened.png \
+  --morph-op open \
+  --morph-kernel 5
 
 # Get mask statistics
 python run_binary_mask_converter.py \
@@ -127,6 +154,43 @@ python run_binary_mask_converter.py \
   --invert \
   --verbose
 ```
+
+### 7. Video Mask Processing (Standalone)
+
+Process an entire mask video frame-by-frame (binarize, invert, morph ops):
+
+```bash
+# Convert a mask video to binary and invert
+python run_binary_mask_converter.py \
+  --input-video ./masks.mp4 \
+  --output-video ./masks_binary.mp4 \
+  --threshold 0.08 \
+  --invert
+
+# With custom codec and FPS
+python run_binary_mask_converter.py \
+  --input-video ./masks.mp4 \
+  --output-video ./masks_binary.mp4 \
+  --video-codec mp4v \
+  --video-fps 30.0 \
+  --morph-op close \
+  --morph-kernel 5 \
+  --verbose
+```
+
+Reports mean coverage percentage across all processed frames.
+When processing compressed mask videos, thresholding operates on scaled grayscale intensities rather than treating every non-zero pixel as foreground.
+
+### Runtime Stability Note
+
+- Torch compile is **disabled by default** in `run_concept_segmentation.py`.
+- Use `--compile` only if your runtime is stable with Torch Inductor.
+- On some MIG/A100 environments, keeping compile disabled is more reliable.
+- Use `--offload-video-to-cpu` on constrained/MIG GPUs for safer inference.
+- Use `--disable-tf32` for stability at the cost of speed.
+- Use `--max-num-objects N` to cap tracked objects and reduce memory pressure.
+- Use `--no-inter-chunk-cuda-drain` to disable explicit GPU cleanup between chunks.
+- Use `--inter-chunk-sleep-sec S` for optional delay between chunk processing.
 
 ## Configuration
 
@@ -163,7 +227,7 @@ The module supports three memory bank management strategies:
 
 **3. BINARY_MASKS_ONLY**
 - Raw binary thresholded masks
-- Saved as image sequence or PNG stack
+- Saved as image sequence (PNG directory) or as a video file (when `--output` has a video extension)
 - Suitable for downstream processing
 
 ### Propagation Directions
@@ -179,7 +243,12 @@ The module supports three memory bank management strategies:
 Controls core segmentation behavior:
 
 ```python
-from concepts.config import ConceptSegmentationConfig, PropagationDirection, MemoryStrategy
+from concepts.config import (
+    ConceptSegmentationConfig,
+    PropagationDirection,
+    MemoryStrategy,
+    ExemplarPlacement,
+)
 
 config = ConceptSegmentationConfig(
     concepts=["traffic sign", "speed limit"],
@@ -189,6 +258,25 @@ config = ConceptSegmentationConfig(
     memory_strategy=MemoryStrategy.RESET_PER_CHUNK,
     output_prob_thresh=0.5,
     apply_temporal_disambiguation=True,
+    # Exemplar injection (optional):
+  exemplar_image_path="../SL30_image_examplar_00.webp",
+    exemplar_image_bbox=(145, 98, 62, 64),  # x, y, w, h in source image pixels
+    exemplar_placement=ExemplarPlacement.LETTERBOX,
+    exemplar_box_label=1,  # 1=positive, 0=negative
+    debug_exemplar_preview_path="./debug/preview.jpg",
+    # CUDA stability (optional):
+    offload_video_to_cpu=False,
+    disable_tf32=False,
+    max_num_objects=None,
+    inter_chunk_cuda_drain=True,
+    inter_chunk_sleep_sec=0.0,
+    # Model options:
+    compile=False,
+    has_presence_token=True,
+    geo_encoder_use_img_cross_attn=True,
+    strict_state_dict_loading=True,
+    async_loading_frames=False,
+    video_loader_type="cv2",
 )
 ```
 
@@ -214,28 +302,53 @@ Controls binary mask conversion:
 from concepts.config import BinaryMaskConfig
 
 config = BinaryMaskConfig(
-    threshold=0.5,
+    threshold=0.08,  # Default: 0.08 (low to capture soft masks)
     invert=False,
     dilate_kernel_size=None,
     erode_kernel_size=None,
 )
 ```
 
+### VideoIOConfig
+
+Controls video codec and encoding:
+
+```python
+from concepts.config import VideoIOConfig
+
+config = VideoIOConfig(
+    video_codec="mp4v",
+    quality=23,        # CRF; lower = better quality
+    target_fps=None,   # None = same as input
+)
+```
+
+### ExemplarPlacement Enum
+
+How an external exemplar image is fitted to the target video resolution:
+
+- **LETTERBOX**: Preserve aspect ratio, pad to video size, remap bbox with scale+offset.
+- **CANVAS**: No resizing, center on padded canvas, remap bbox by offset only (source must fit target).
+
 ## Programmatic Usage
 
 ### End-to-End Segmentation
 
 ```python
-from concepts.config import ConceptSegmentationConfig
+from concepts.config import ConceptSegmentationConfig, ExemplarPlacement
 from concepts.sam3_concepts_segmenter import ConceptSegmentationStrategy
 from concepts.mask_processor import MaskProcessor
 from sam3.model.sam3_video_predictor import Sam3VideoPredictor
 
-# Configure
+# Configure (exemplar fields optional)
 config = ConceptSegmentationConfig(
     concepts=["speed limit sign"],
     chunk_size=130,
     overlap=26,
+    # Optional exemplar injection:
+    # exemplar_image_path="../SL30_image_examplar_00.webp",
+    # exemplar_image_bbox=(145, 98, 62, 64),
+    # exemplar_placement=ExemplarPlacement.LETTERBOX,
 )
 
 # Load video and plan chunks
@@ -363,7 +476,20 @@ watch nvidia-smi
 
 - Reduce `--chunk-size`
 - Switch to `--memory-strategy reset_per_chunk`
+- Use `--offload-video-to-cpu` to keep frames on CPU
+- Use `--disable-tf32` for more stable (but slower) computation on MIG GPUs
+- Use `--max-num-objects 5000` to limit tracked objects
 - Clear GPU cache manually: `torch.cuda.empty_cache()`
+
+### CUDA Allocator Asserts (MIG/A100)
+
+On some MIG setups, propagation can trigger PyTorch allocator asserts (`NVML_SUCCESS`/`CUDACachingAllocator`). The strategy layer automatically retries with progressive fallbacks:
+1. Original config
+2. + `offload_video_to_cpu=True`
+3. + `disable_tf32=True`
+4. + `max_num_objects=5000`
+
+Manual mitigation: use `--offload-video-to-cpu --disable-tf32` from the start.
 
 ### Poor Mask Quality
 

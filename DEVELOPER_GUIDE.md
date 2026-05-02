@@ -10,8 +10,11 @@ This guide explains the internal structure of the `concepts/` module for develop
 
 ```
 segmentation_with_concepts/
+├── README.md                            # Workspace overview
 ├── INTEGRATION_GUIDE.md                 # Practical usage examples
-├── sam3/
+├── DEVELOPER_GUIDE.md                   # This file
+├── SL30_image_examplar_*.webp           # Sample external exemplar assets (repo root)
+└── sam3/
 │   ├── concepts/                        # Concept segmentation module
 │   │   ├── __init__.py                  # Package exports
 │   │   ├── config.py                    # Configuration dataclasses
@@ -22,10 +25,11 @@ segmentation_with_concepts/
 │   │   └── README.md                    # Module documentation
 │   ├── run_concept_segmentation.py      # Main CLI tool
 │   ├── run_binary_mask_converter.py     # Binary mask CLI tool
+│   ├── scripts/
+│   │   └── overlay_with_binary_selector.py  # Binary-guided compositing tool
 │   ├── model/                           # SAM3 model files
 │   ├── examples/                        # SAM3 examples
 │   └── ... (other SAM3 files)
-└── Developer_Guide.md                   # This file
 ```
 
 ---
@@ -40,9 +44,11 @@ segmentation_with_concepts/
 - `PropagationDirection` - Enum for forward/backward/both
 - `OutputMode` - Enum for overlay/segmented/binary
 - `MemoryStrategy` - Enum for reset/continuous/decay
-- `ConceptSegmentationConfig` - Main segmentation parameters
+- `ExemplarPlacement` - Enum for letterbox/canvas (exemplar image fitting mode)
+- `ConceptSegmentationConfig` - Main segmentation parameters (includes exemplar injection, CUDA stability, and compile settings)
 - `MaskProcessorConfig` - Rendering parameters
-- `BinaryMaskConfig` - Binary conversion parameters
+- `BinaryMaskConfig` - Binary conversion parameters (default threshold: 0.08)
+- `VideoIOConfig` - Video codec, quality, and FPS settings
 
 **Design Principles**:
 - ✅ Use enums for safety (prevent invalid values)
@@ -146,6 +152,9 @@ def new_utility_function(param1: np.ndarray, param2: int) -> np.ndarray:
    - Main orchestration class
    - Coordinates video loading, chunking, prediction, aggregation
    - Exposes clear API: load → plan → process → get_outputs
+   - **Exemplar injection**: Supports external image as pseudo-frame per chunk (letterbox/canvas fitting, bbox remapping)
+   - **CUDA stability**: Progressive fallback retry on allocator asserts (offload → disable TF32 → reduce objects)
+   - **Inter-chunk drain**: Explicit GPU cleanup and optional sleep between chunks
 
 **Architecture Notes**:
 - ✅ User-level orchestration: controls when SAM3 sessions are opened and closed
@@ -157,13 +166,24 @@ def new_utility_function(param1: np.ndarray, param2: int) -> np.ndarray:
 
 ```python
 class ConceptSegmentationStrategy:
-    def load_video(video_path)           # Stage 1: Load
+    def load_video(video_path)           # Stage 1: Load + exemplar prep
     def plan_chunks()                    # Stage 2: Plan
-    def process_chunks(predictor)        # Stage 3: Process (main inference)
+    def process_chunks(predictor, progress_callback=None)  # Stage 3: Process (with CUDA retry)
     def get_outputs_for_frame(idx)       # Stage 4: Query results
     def get_all_outputs()                # Stage 4: Get all results
     def get_summary()                    # Reporting
     def dry_run()                        # Validation
+
+    # Internal (exemplar injection):
+    def _prepare_exemplar_prompt_if_needed()   # Fit exemplar image + remap bbox
+    def _build_pseudo_chunk_video(start, end)  # Temp video with exemplar as frame 0
+    def _add_initial_prompt(predictor, ...)     # Text and/or visual prompt seeding
+
+    # Internal (CUDA stability):
+    def _process_chunk(predictor, start, end)  # Progressive fallback retry
+    def _drain_between_chunks(has_next)        # GPU drain + optional sleep
+    def _safe_cuda_cleanup()                   # gc + empty_cache + ipc_collect
+    def _configure_session_stability(...)      # TF32 / max_num_objects
 ```
 
 **Extending ConceptSegmentationStrategy**:
@@ -178,6 +198,26 @@ class ConceptSegmentationStrategy:
             callback(chunk_idx, start, end)
             self._process_chunk(predictor, start, end)
 ```
+
+**Exemplar Injection Architecture**:
+
+When `exemplar_image_path` and `exemplar_image_bbox` are configured:
+1. `load_video()` calls `_prepare_exemplar_prompt_if_needed()` which fits the exemplar to video resolution (letterbox or canvas) and remaps the bbox.
+2. Each chunk creates a temporary video with the fitted exemplar as frame 0 via `_build_pseudo_chunk_video()`.
+3. `_add_initial_prompt()` sends both text and visual bbox cues in a single `add_prompt` request.
+4. Propagation results for frame 0 (pseudo-frame) are dropped; remaining indices are offset by -1 to map back to the original video.
+
+For this repo specifically, the root-level files `SL30_image_examplar_00.webp` through `SL30_image_examplar_05.webp` are sample assets for this workflow.
+
+**CUDA Fallback Strategy**:
+
+`_process_chunk()` implements progressive retry for allocator asserts (common on MIG/A100):
+1. Original config settings
+2. + `offload_video_to_cpu=True`
+3. + `disable_tf32=True`
+4. + `max_num_objects=5000`
+
+Between chunks, `_drain_between_chunks()` runs `gc.collect()`, `torch.cuda.empty_cache()`, `ipc_collect()`, and optional sleep.
 
 ---
 
@@ -203,8 +243,8 @@ class MaskProcessor:
 **Key Methods**:
 - `set_palette()` - Configure colors
 - `process_frame()` - Process single frame
-- `save_video()` - Write output video
-- `save_mask_frames()` - Write mask sequence
+- `save_video()` - Write output video with codec fallback (`mp4v`, `XVID`, `MJPG`, `DIVX`, `WMV1`)
+- `save_mask_frames()` - Write mask sequence after collapsing multi-object stacks to one per-frame binary mask
 
 **Adding New Output Mode**:
 
@@ -233,6 +273,7 @@ class MaskProcessor:
 - ✅ Decoupled from segmentation (can work on any masks)
 - ✅ Batch operations support
 - ✅ Comprehensive statistics
+- ✅ `convert_to_binary()` preserves numeric mask intensities before thresholding, which avoids treating codec artifacts in mask videos as foreground
 
 **Adding New Operation**:
 
@@ -266,7 +307,12 @@ def new_operation(self, mask, param):
 4. Plan chunks → `ConceptSegmentationStrategy.plan_chunks()`
 5. Process → `ConceptSegmentationStrategy.process_chunks()`
 6. Render → `MaskProcessor.process_frame()`
-7. Save → `MaskProcessor.save_video()`
+7. Save → `MaskProcessor.save_video()` or `MaskProcessor.save_mask_frames()`
+
+**Notable current behavior**:
+- External exemplar prompting is enabled through `--exemplar-image`, `--exemplar-bbox`, `--exemplar-placement`, `--exemplar-box-label`, and `--debug-exemplar-preview`.
+- Binary-mask mode can save either a PNG directory or a mask video depending on whether `--output` has a video extension.
+- Stability flags include `--offload-video-to-cpu`, `--disable-tf32`, `--max-num-objects`, `--no-inter-chunk-cuda-drain`, and `--inter-chunk-sleep-sec`.
 
 **Adding New CLI Flag**:
 
@@ -284,14 +330,47 @@ args.new_flag
 
 ### `run_binary_mask_converter.py` - Mask Tool
 
-**Flow**:
+**Three input modes** (mutually exclusive):
+1. **Single image** (`--input`): Process one mask PNG. Supports `--stats` for statistics-only.
+2. **Batch directory** (`--batch-dir`): Process all masks matching `--file-pattern` (default `*.png`).
+3. **Video** (`--input-video`): Process a mask video frame-by-frame.
+
+**Flow (single/batch)**:
 1. Parse arguments
 2. Validate input paths
 3. Load mask(s)
-4. Apply conversions → `BinaryMaskConverter`
-5. Save result(s)
+4. Apply conversions → `BinaryMaskConverter` (threshold, invert, dilate, erode)
+5. Optionally apply `--morph-op` (open/close/dilate/erode) with `--morph-kernel`
+6. Save result(s)
 
-**Design**: Supports both single-file and batch processing
+**Flow (video mode)**:
+1. Parse arguments (`--input-video`, `--output-video`)
+2. Open input video, read frames sequentially
+3. Convert each frame to grayscale → apply morph ops → binarize
+4. Write processed frames to output video (`--video-codec`, `--video-fps`)
+5. Report mean coverage percentage across all frames
+
+**Key defaults**: threshold=0.08, codec=mp4v
+
+**Design**: Supports single-file, batch, and video processing modes
+
+### `scripts/overlay_with_binary_selector.py` - Video Compositing Tool
+
+**Purpose**: Composite a segmented mask video onto a base video using a binary per-pixel selector.
+
+**Flow**:
+1. Parse arguments (base video, mask video, binary selector, output)
+2. Open all input videos and validate sizes
+3. For each frame: threshold binary selector → use white pixels to pick from mask video, black from base
+4. Write composited frames to output video
+
+**Key Features**:
+- Automatic resizing of selector/mask if sizes differ (unless `--strict-size-check`)
+- Optional inverted binary selector for sanity-checking complement consistency
+- Configurable threshold [0-255] for binarization
+- Frame cap via `--max-frames`
+
+**Design**: Standalone script, no dependency on `concepts/` module. Works with any three input videos of matching frame counts.
 
 ---
 
