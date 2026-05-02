@@ -51,9 +51,25 @@ class BinaryMaskConverter:
             Binary mask (uint8: 0 or 255).
         """
         threshold = threshold or self.config.threshold
-        
-        mask = normalize_mask(mask).astype(np.float32)
-        binary = (mask > threshold).astype(np.uint8) * 255
+
+        # Convert torch tensor if needed
+        if hasattr(mask, "detach"):
+            mask = mask.detach().float().cpu().numpy()
+        mask = np.asarray(mask)
+        if mask.ndim == 3:
+            mask = mask.squeeze()
+
+        # Scale to [0, 1] float WITHOUT converting to bool first.
+        # normalize_mask() would cast to bool, causing any non-zero pixel
+        # (including video-codec compression artifacts) to pass any threshold.
+        if mask.dtype == np.uint8:
+            mask_float = mask.astype(np.float32) / 255.0
+        elif mask.dtype == bool:
+            mask_float = mask.astype(np.float32)
+        else:
+            mask_float = np.clip(mask.astype(np.float32), 0.0, 1.0)
+
+        binary = (mask_float > threshold).astype(np.uint8) * 255
         
         # Apply morphological operations
         if self.config.dilate_kernel_size is not None:

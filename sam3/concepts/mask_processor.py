@@ -9,6 +9,7 @@ Provides flexible mask rendering in multiple formats:
 
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+import sys
 import numpy as np
 import cv2
 
@@ -233,34 +234,65 @@ class MaskProcessor:
         codec: str = "mp4v"
     ) -> None:
         """
-        Save processed frames as video.
+        Save processed frames as video with automatic codec fallback.
         
         Args:
             frames: List of processed frame arrays.
             output_path: Path to output video file.
             fps: Frames per second.
             codec: Video codec (default: "mp4v" for MP4).
+            
+        Tries codecs in order: mp4v -> XVID -> MJPEG -> DIVX
         """
         if not frames:
             raise ValueError("Cannot save video: no frames provided")
         
+        # Ensure output directory exists
+        output_p = Path(output_path)
+        output_p.parent.mkdir(parents=True, exist_ok=True)
+        
         height, width = frames[0].shape[:2]
         
-        writer = cv2.VideoWriter(
-            output_path,
-            cv2.VideoWriter_fourcc(*codec),
-            fps,
-            (width, height)
+        # Try codecs in fallback order
+        codec_options = [codec, "XVID", "MJPG", "DIVX", "WMV1"]
+        last_error = None
+        
+        for try_codec in codec_options:
+            try:
+                writer = cv2.VideoWriter(
+                    str(output_p),
+                    cv2.VideoWriter_fourcc(*try_codec),
+                    float(fps),
+                    (width, height)
+                )
+                
+                if writer.isOpened():
+                    try:
+                        for frame in frames:
+                            writer.write(frame)
+                        print(
+                            f"[INFO] Video saved with codec '{try_codec}': {output_path}",
+                            file=sys.stderr
+                        )
+                        return
+                    finally:
+                        writer.release()
+                else:
+                    last_error = f"codec '{try_codec}' cannot open writer"
+                    continue
+            except Exception as e:
+                last_error = str(e)
+                continue
+        
+        # All codecs failed
+        error_msg = (
+            f"Cannot save video: all codec attempts failed. "
+            f"Last error: {last_error}. "
+            f"Tried codecs: {', '.join(codec_options)}. "
+            f"Output: {output_path} | "
+            f"FPS: {fps} | Resolution: {width}x{height}"
         )
-        
-        if not writer.isOpened():
-            raise RuntimeError(f"Cannot open video writer for: {output_path}")
-        
-        try:
-            for frame in frames:
-                writer.write(frame)
-        finally:
-            writer.release()
+        raise RuntimeError(error_msg)
     
     def save_mask_frames(
         self,
@@ -280,8 +312,28 @@ class MaskProcessor:
         output_path.mkdir(parents=True, exist_ok=True)
         
         for frame_idx, mask in masks_per_frame.items():
-            mask_normalized = normalize_mask(mask)
+            if mask is None:
+                continue
+
+            # `out_binary_masks` is typically shaped as (num_objects, H, W).
+            # Collapse object dimension into a single per-frame binary mask.
+            mask_arr = np.asarray(mask)
+            if mask_arr.size == 0:
+                continue
+            if mask_arr.ndim >= 3:
+                mask_arr = np.any(mask_arr, axis=0)
+
+            mask_normalized = normalize_mask(mask_arr)
+            if mask_normalized.size == 0:
+                continue
+            if mask_normalized.ndim != 2:
+                raise ValueError(
+                    f"Expected 2D mask for frame {frame_idx}, got shape {mask_normalized.shape}"
+                )
+
             mask_uint8 = (mask_normalized.astype(np.uint8) * 255)
             
             filename = output_path / f"{prefix}_{frame_idx:06d}.png"
-            cv2.imwrite(str(filename), mask_uint8)
+            ok = cv2.imwrite(str(filename), mask_uint8)
+            if not ok:
+                raise RuntimeError(f"Failed to write mask image: {filename}")
