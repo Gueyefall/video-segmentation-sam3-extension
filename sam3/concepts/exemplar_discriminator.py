@@ -55,7 +55,7 @@ class Sam3CropEncoder:
 
         self.detector = detector
         self.checkpoint_sha256 = checkpoint_sha256
-        self.processor = Sam3Processor(detector)
+        self.processor = Sam3Processor(detector, device=detector.device)
 
     def __call__(self, crop: np.ndarray) -> np.ndarray:
         import torch

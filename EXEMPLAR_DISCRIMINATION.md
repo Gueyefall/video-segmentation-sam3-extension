@@ -163,9 +163,12 @@ and references must be recalibrated for that encoder.
    precision/backend, or image domain. Hash checks establish provenance, not
    generalization or scientific validity.
 
-CUDA encoding explicitly uses BF16 autocast; CPU execution uses FP32 and needs
-separate validation. Candidate feature extraction adds inference cost; include it
-in runtime comparisons rather than reporting segmentation time alone.
+The crop encoder uses the loaded detector's device. CUDA encoding explicitly uses
+BF16 autocast; a separately loaded CPU detector uses FP32 and needs separate
+validation. The repository's video predictor and crop-validation runner require
+CUDA; encoder-level CPU support does not make the video pipeline CPU-compatible.
+Candidate feature extraction adds inference cost; include it in runtime
+comparisons rather than reporting segmentation time alone.
 
 ### Reproducible frozen-configuration validation
 

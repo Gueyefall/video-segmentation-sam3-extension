@@ -6,9 +6,10 @@ from unittest.mock import Mock
 
 import cv2
 import numpy as np
+import torch
 
 from concepts.exemplar_discriminator import (
-    ENCODER_ID, ExemplarDiscriminator, filter_video_outputs, load_discriminator,
+    ENCODER_ID, ExemplarDiscriminator, Sam3CropEncoder, filter_video_outputs, load_discriminator,
 )
 
 
@@ -21,6 +22,15 @@ def make_filter():
 
 
 class TestExemplarDiscriminator(unittest.TestCase):
+    def test_crop_encoder_uses_detector_device_without_requiring_cuda(self):
+        detector = Mock(device=torch.device("cpu"))
+        detector.backbone.forward_image.side_effect = lambda image: {"backbone_fpn": [image]}
+        encoder = Sam3CropEncoder(detector, checkpoint_sha256="test")
+        descriptor = encoder(np.full((4, 4, 3), 255, dtype=np.uint8))
+        self.assertEqual(encoder.processor.device, torch.device("cpu"))
+        self.assertEqual(descriptor.shape, (3 * 8 * 8,))
+        self.assertAlmostEqual(float(np.linalg.norm(descriptor)), 1.0, places=5)
+
     def test_requires_positive_similarity_and_margin_over_hard_negative(self):
         gate = make_filter()
         self.assertTrue(gate.score(np.array([1.0, 0.0])).accepted)
