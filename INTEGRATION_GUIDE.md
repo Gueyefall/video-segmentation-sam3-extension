@@ -8,6 +8,22 @@ This guide explains how to use the `concepts/` module and its CLI tools, with pr
 
 ## Quick Start
 
+### Local checkpoints / offline inference
+
+Use `--checkpoint /path/to/sam3.pt` to load a previously downloaded checkpoint
+without requesting model weights from Hugging Face. The checkpoint must match
+the model backend. An invalid file path is rejected before inference.
+Omitting this option preserves the backend's automatic download behavior.
+
+### Positive/negative exemplar discrimination
+
+Use the opt-in `--filter-exemplars` stage to discriminate a wanted visual subclass
+from similar candidates after segmentation. See
+[Exemplar discrimination](EXEMPLAR_DISCRIMINATION.md) for the frozen-feature
+algorithm, configuration, hard negatives, calibration, abstention, validation,
+runtime accounting, licensing, and limitations. This is separate from the
+existing exemplar pseudo-frame prompting mechanism.
+
 ### Installation
 
 ```bash

@@ -97,6 +97,14 @@ def parse_exemplar_box(box_text: str) -> Tuple[float, float, float, float]:
     return x, y, width, height
 
 
+def parse_checkpoint_path(value: str) -> str:
+    """Resolve an explicitly supplied checkpoint before initializing the model."""
+    path = Path(value).expanduser().resolve()
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"Checkpoint is not a file: {path}")
+    return str(path)
+
+
 def build_argument_parser():
     """Build and return CLI argument parser."""
     parser = argparse.ArgumentParser(
@@ -159,6 +167,12 @@ Examples:
         help="Dot-separated semantic concepts (e.g., 'traffic sign. speed limit sign.')",
     )
 
+    parser.add_argument(
+        "--checkpoint",
+        type=parse_checkpoint_path,
+        help="Local model checkpoint; omit to use the backend's Hugging Face download",
+    )
+
     # Optional external exemplar pseudo-frame injection
     parser.add_argument(
         "--exemplar-image",
@@ -185,6 +199,15 @@ Examples:
     parser.add_argument(
         "--debug-exemplar-preview",
         help="Optional output image path for fitted exemplar preview with remapped bbox",
+    )
+    parser.add_argument(
+        "--filter-exemplars",
+        type=parse_checkpoint_path,
+        help="Opt-in positive/negative exemplar discrimination JSON; requires --checkpoint.",
+    )
+    parser.add_argument(
+        "--exemplar-report",
+        help="Decision JSONL path; defaults to OUTPUT_exemplar_decisions.jsonl.",
     )
     
     # Output rendering
@@ -304,6 +327,10 @@ def main():
     """Main entry point."""
     parser = build_argument_parser()
     args = parser.parse_args()
+    if args.filter_exemplars and not args.checkpoint:
+        parser.error("--filter-exemplars requires an explicit --checkpoint for calibration verification.")
+    if args.exemplar_report and not args.filter_exemplars:
+        parser.error("--exemplar-report requires --filter-exemplars.")
     
     # Validate PyTorch
     if torch is None:
@@ -443,7 +470,7 @@ def main():
     
     try:
         predictor = Sam3VideoPredictor(
-            checkpoint_path=None,
+            checkpoint_path=args.checkpoint,
             bpe_path=None,
             has_presence_token=segmentation_config.has_presence_token,
             geo_encoder_use_img_cross_attn=segmentation_config.geo_encoder_use_img_cross_attn,
@@ -475,6 +502,18 @@ def main():
     
     output_frames = []
     all_outputs = strategy.get_all_outputs()
+    if args.filter_exemplars:
+        from concepts.exemplar_discriminator import (
+            Sam3CropEncoder, file_sha256, filter_video_outputs, load_discriminator,
+        )
+
+        report = Path(args.exemplar_report).expanduser().resolve() if args.exemplar_report else (
+            output_path.parent / f"{output_path.stem}_exemplar_decisions.jsonl")
+        print("[INFO] Applying configured positive/negative exemplar discrimination...", file=sys.stderr)
+        encoder = Sam3CropEncoder(predictor.model.detector, file_sha256(Path(args.checkpoint)))
+        gate = load_discriminator(Path(args.filter_exemplars), encoder)
+        all_outputs = filter_video_outputs(strategy.video_frames, all_outputs, gate, report)
+        print(f"[INFO] Exemplar decisions saved to: {report}", file=sys.stderr)
     
     for frame_idx, frame in enumerate(strategy.video_frames):
         outputs = all_outputs.get(frame_idx, {})
