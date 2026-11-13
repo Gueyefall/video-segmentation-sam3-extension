@@ -118,6 +118,17 @@ class TestExemplarDiscriminator(unittest.TestCase):
             self.assertEqual(records[0]["type"], "provenance")
             self.assertEqual(records[1]["decisions"][0]["reason"], "accept")
 
+    def test_video_filter_never_overwrites_an_existing_report(self):
+        frame = np.ones((3, 3, 3), np.uint8)
+        outputs = {0: {"out_obj_ids": np.array([3]),
+                       "out_binary_masks": np.ones((1, 3, 3), bool)}}
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "existing.jsonl"
+            report.write_text("existing data", encoding="utf-8")
+            with self.assertRaises(FileExistsError):
+                filter_video_outputs([frame], outputs, make_filter(), report)
+            self.assertEqual(report.read_text(encoding="utf-8"), "existing data")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,9 @@ def main() -> None:
     parser.add_argument("--examples", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
+    report = args.report.expanduser().resolve()
+    if report.exists():
+        parser.error(f"--report already exists: {report}; choose a new path.")
     if not torch.cuda.is_available():
         parser.error("This validation runner requires CUDA; no unvalidated CPU fallback is used.")
     if not args.checkpoint.is_file():
@@ -77,8 +80,9 @@ def main() -> None:
         "examples": records,
         "limitations": "Small or correlated crop sets do not establish population accuracy.",
     }
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(result, indent=2), encoding="utf-8")
+    report.parent.mkdir(parents=True, exist_ok=True)
+    with report.open("x", encoding="utf-8") as stream:
+        json.dump(result, stream, indent=2)
     print(json.dumps({key: value for key, value in result.items() if key != "examples"}, indent=2))
 
 

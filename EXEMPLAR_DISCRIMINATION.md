@@ -112,6 +112,10 @@ Without `--exemplar-report`, the report is written next to the requested output 
 checkpoint, encoder, and reference-file hashes; subsequent records contain
 per-frame decisions. An explicit local checkpoint is required so calibration
 cannot silently be applied to different weights.
+Reports must be new files: existing files are never overwritten, and the CLI
+rejects report paths that overlap the output video or mask directory before
+inference. Choose a new path for each run. A failed filtering run may leave an
+incomplete report; treat it as incomplete and use a new path when retrying.
 
 `--exemplar-image` is the older pseudo-frame prompting mechanism. It changes the
 input to inference. `--filter-exemplars` is independent and filters inference
@@ -198,6 +202,7 @@ This CUDA validation runner evaluates the frozen configuration; it does not fit
 thresholds on the held-out set. It reports accepted precision, false accepts,
 positive acceptance, abstentions, scene counts, per-example scores/timing, and
 image/configuration hashes. Use `split: "development"` for tuning experiments.
+The validation report must also be a new file.
 Do not silently re-label a failed held-out set as a successful validation after
 tuning to it.
 

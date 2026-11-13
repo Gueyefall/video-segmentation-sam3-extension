@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 
 import run_concept_segmentation as cli
+from scripts import validate_exemplar_discriminator as validation_cli
 
 
 class TestLocalCheckpoint(unittest.TestCase):
@@ -56,6 +57,73 @@ class TestLocalCheckpoint(unittest.TestCase):
                     cli.main()
                 strategy.assert_not_called()
                 self.assertIn("--checkpoint", "".join(call.args[0] for call in error.write.call_args_list))
+
+    def test_exemplar_report_must_not_overwrite_inputs_or_overlap_output(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video, checkpoint, config = root / "input.mp4", root / "model.pt", root / "filter.json"
+            for path in (video, checkpoint, config):
+                path.write_text("existing data", encoding="utf-8")
+            video_output, mask_output = root / "output.mp4", root / "masks"
+            default_report = root / "output_exemplar_decisions.jsonl"
+            default_report.write_text("existing data", encoding="utf-8")
+            cases = [
+                (video_output, video, []),
+                (video_output, checkpoint, []),
+                (video_output, config, []),
+                (video_output, video_output, []),
+                (video_output, None, []),
+                (mask_output, mask_output / "concept_mask_000000.png",
+                 ["--output-mode", "binary_masks_only"]),
+                (root / "masks.json", mask_output / "concept_mask_000000.png",
+                 ["--output-mode", "binary_masks_only"]),
+            ]
+            for output, report, extra in cases:
+                arguments = ["run_concept_segmentation", "--video", str(video), "--output",
+                             str(output), "--concepts", "object", "--checkpoint", str(checkpoint),
+                             "--filter-exemplars", str(config)] + extra
+                if report is not None:
+                    arguments += ["--exemplar-report", str(report)]
+                with self.subTest(report=report), patch("sys.argv", arguments), patch("sys.stderr"), \
+                        patch.object(cli, "ConceptSegmentationStrategy") as strategy:
+                    with self.assertRaises(SystemExit):
+                        cli.main()
+                    strategy.assert_not_called()
+            for path in (video, checkpoint, config, default_report):
+                self.assertEqual(path.read_text(encoding="utf-8"), "existing data")
+            self.assertFalse(video_output.exists())
+            self.assertFalse(mask_output.exists())
+
+    def test_validation_report_must_not_overwrite_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report = Path(tmpdir) / "existing.json"
+            report.write_text("existing data", encoding="utf-8")
+            arguments = ["validate_exemplar_discriminator", "--checkpoint", "model.pt",
+                         "--config", "filter.json", "--examples", "examples.json",
+                         "--report", str(report)]
+            with patch("sys.argv", arguments), patch("sys.stderr") as error, \
+                    patch.object(validation_cli.torch.cuda, "is_available") as cuda:
+                with self.assertRaises(SystemExit):
+                    validation_cli.main()
+                cuda.assert_not_called()
+                self.assertIn("already exists", "".join(call.args[0] for call in error.write.call_args_list))
+            self.assertEqual(report.read_text(encoding="utf-8"), "existing data")
+
+    def test_mask_directory_dry_run_without_filter_preserves_existing_behavior(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            video = root / "input.mp4"
+            video.touch()
+            strategy = Mock()
+            strategy.dry_run.return_value = True
+            arguments = ["run_concept_segmentation", "--video", str(video), "--output",
+                         str(root / "masks.data"), "--concepts", "object",
+                         "--output-mode", "binary_masks_only", "--dry-run"]
+            with patch("sys.argv", arguments), patch("sys.stderr"), \
+                    patch.object(cli, "ConceptSegmentationStrategy", return_value=strategy):
+                cli.main()
+            self.assertTrue((root / "masks").is_dir())
+            self.assertFalse((root / "masks_exemplar_decisions.jsonl").exists())
 
     def test_opt_in_filter_is_applied_before_mask_export(self):
         with tempfile.TemporaryDirectory() as tmpdir:

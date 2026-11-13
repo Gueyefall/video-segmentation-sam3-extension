@@ -22,5 +22,6 @@ Dependencies and installation instructions are managed by SAM3:
 ## Documentation
 
 - `INTEGRATION_GUIDE.md` — Usage examples and CLI reference.
+- [EXEMPLAR_DISCRIMINATION.md](EXEMPLAR_DISCRIMINATION.md) — Exemplar filtering, calibration, validation, and limitations.
 - `DEVELOPER_GUIDE.md` — Module structure and extension guide.
 - `sam3/concepts/README.md` — `concepts/` module API reference.

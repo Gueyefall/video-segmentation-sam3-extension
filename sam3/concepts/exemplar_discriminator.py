@@ -204,7 +204,7 @@ def filter_video_outputs(frames: list, outputs: dict, gate: ExemplarDiscriminato
         raise ValueError("Incomplete inference output; do not infer missing frames as empty masks.")
     filtered = {}
     report.parent.mkdir(parents=True, exist_ok=True)
-    with report.open("w", encoding="utf-8") as stream:
+    with report.open("x", encoding="utf-8") as stream:
         stream.write(json.dumps({"type": "provenance", **gate.provenance}) + "\n")
         for index, frame in enumerate(frames):
             filtered[index], decisions = gate.filter_frame(frame, outputs[index])

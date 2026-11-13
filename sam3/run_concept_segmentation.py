@@ -207,7 +207,7 @@ Examples:
     )
     parser.add_argument(
         "--exemplar-report",
-        help="Decision JSONL path; defaults to OUTPUT_exemplar_decisions.jsonl.",
+        help="New decision JSONL path; defaults to OUTPUT_exemplar_decisions.jsonl.",
     )
     
     # Output rendering
@@ -345,17 +345,29 @@ def main():
         and output_path.suffix.lower() in binary_video_exts
     )
     binary_output_dir = output_path
+    if args.output_mode == "binary_masks_only" and not binary_output_is_video and output_path.suffix:
+        binary_output_dir = output_path.with_suffix("").resolve()
     
     if not video_path.exists():
         fail(f"Input video does not exist: {video_path}")
     
+    report = Path(args.exemplar_report).expanduser().resolve() if args.exemplar_report else (
+        output_path.parent / f"{output_path.stem}_exemplar_decisions.jsonl")
+    if args.filter_exemplars:
+        if report == output_path or (
+            args.output_mode == "binary_masks_only" and not binary_output_is_video
+            and (report == binary_output_dir or binary_output_dir in report.parents)
+        ):
+            parser.error("--exemplar-report must not overlap the output video or mask directory.")
+        if report.exists():
+            parser.error(f"Exemplar report already exists: {report}; choose a new path.")
+
     # Create output directory if needed
     if args.output_mode == "binary_masks_only":
         # Binary mask mode supports either video output or PNG frame directory output.
         if binary_output_is_video:
             output_path.parent.mkdir(parents=True, exist_ok=True)
         elif output_path.suffix:
-            binary_output_dir = output_path.with_suffix("")
             print(
                 f"[WARN] --output '{output_path}' looks like a file path; "
                 f"using directory '{binary_output_dir}' for binary mask frames.",
@@ -507,8 +519,6 @@ def main():
             Sam3CropEncoder, file_sha256, filter_video_outputs, load_discriminator,
         )
 
-        report = Path(args.exemplar_report).expanduser().resolve() if args.exemplar_report else (
-            output_path.parent / f"{output_path.stem}_exemplar_decisions.jsonl")
         print("[INFO] Applying configured positive/negative exemplar discrimination...", file=sys.stderr)
         encoder = Sam3CropEncoder(predictor.model.detector, file_sha256(Path(args.checkpoint)))
         gate = load_discriminator(Path(args.filter_exemplars), encoder)
